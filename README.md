@@ -30,11 +30,45 @@ Then, in any chat: *"查一下 X 最新的情况"* and Alma will reach for it.
 
 ```bash
 git clone https://github.com/adfoke/deepseek-search
-ln -sf "$PWD/deepseek-search/dssearch.py" ~/.local/bin/dssearch
-dssearch doctor --probe
+cd deepseek-search
+python3 dssearch.py doctor --probe        # works straight from the clone
 ```
 
-Requires Python 3.9+ (macOS, Linux). No dependencies, nothing to `pip install`.
+Nothing to build, nothing to `pip install`: it is one file, and the entire import list is
+`argparse hashlib json os random re sys time urllib`. Python 3.9+ on macOS or Linux.
+
+Optionally put it on PATH:
+
+```bash
+ln -sf "$PWD/dssearch.py" ~/.local/bin/dssearch
+```
+
+## First run
+
+The tool is usable the moment it is cloned — the only thing it needs is a DeepSeek API key.
+Which of these is true decides what you have to do:
+
+| Your situation | What happens |
+|---|---|
+| **Alma running with a DeepSeek provider configured** | Nothing. It finds the key itself. |
+| `DEEPSEEK_API_KEY` is set | Nothing. |
+| You have a key but no Alma | Put it in `~/.config/dssearch/api-key` (see below). |
+| **None of the above** | `exit 3`, one line naming all three places to put a key. No crash, no hang. |
+
+Not an Alma user and no key yet? Create one at
+[platform.deepseek.com](https://platform.deepseek.com/api_keys). Search and fetch are billed per
+successful request ($0.75 / 1000), so a few dollars goes a long way.
+
+```console
+$ python3 dssearch.py doctor
+key: NOT FOUND
+  no DeepSeek API key found. Set $DEEPSEEK_API_KEY, write ~/.config/dssearch/api-key,
+  or configure a DeepSeek provider in Alma.
+$ echo $?
+3
+```
+
+That is the whole failure mode: one line naming the three fixes, and a distinct exit code.
 
 ## API key
 
@@ -47,6 +81,10 @@ Resolved from the first source that exists:
 | 3 | `~/.config/dssearch/api-key` | `chmod 600`, contents stripped |
 | 4 | `~/.config/alma/secrets/deepseek-api-key` | |
 | 5 | **the DeepSeek provider already configured in Alma** | read from Alma's loopback API; nothing to set up |
+
+For #5 the provider must actually point at DeepSeek (type `deepseek`, or a custom provider whose
+host is `api.deepseek.com`). A relay provider is skipped on purpose, so its key is never forwarded
+to DeepSeek — see [the endpoint pin](#the-endpoint-is-pinned-on-purpose).
 
 Source 5 is why an Alma user needs no configuration at all. Alma sometimes has more than one
 DeepSeek provider configured, so the script keeps a candidate list (official provider first),

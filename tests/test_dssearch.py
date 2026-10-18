@@ -39,15 +39,30 @@ FETCH_BODY = {"title": "Example article", "content": "# Example article\n\nArtic
 STATE = "/tmp/dssearch-test-state.json"
 
 
-def run(argv, api_key="sk-test-1234567890abcdef", alma_keys=None, key_files=None):
-    """Run the CLI in a sandbox: env key, fake Alma candidates, temp state file."""
+CACHE = "/tmp/dssearch-test-cache"
+
+
+def run(argv, api_key="sk-test-1234567890abcdef", alma_keys=None, key_files=None, env=None):
+    """Run the CLI in a sandbox: env key, fake Alma candidates, temp state, no cache.
+
+    The cache is off by default here so that each test really exercises the
+    request path; tests/test_transport.py turns it back on to test it.
+    """
     out, err = io.StringIO(), io.StringIO()
     if os.path.exists(STATE):
         os.remove(STATE)
+    environment = {
+        "DEEPSEEK_API_KEY": api_key,
+        "DSSEARCH_CACHE": "0",
+        "DSSEARCH_CACHE_DIR": CACHE,
+        "DSSEARCH_EMPTY_EXIT": "",
+    }
+    environment.update(env or {})
     with mock.patch.object(dssearch, "STATE_FILE", STATE), \
+            mock.patch.object(dssearch, "CACHE_DIR", CACHE), \
             mock.patch.object(dssearch, "KEY_FILES", key_files or ["/nonexistent/key"]), \
             mock.patch.object(dssearch, "alma_key_candidates", return_value=list(alma_keys or [])), \
-            mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": api_key}, clear=False):
+            mock.patch.dict(os.environ, environment, clear=False):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = dssearch.main(argv)
     return code, out.getvalue(), err.getvalue()

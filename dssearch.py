@@ -22,6 +22,7 @@ Only the Python standard library is used (Python 3.9+).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -33,13 +34,21 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TIMEOUT = 30.0
-DEFAULT_RETRIES = 3
+DEFAULT_RETRIES = 2
+# Wall clock budget for one call, retries and backoff included. 2 attempts at a
+# 30s timeout would otherwise be able to block a caller for over a minute.
+DEFAULT_DEADLINE = 45.0
 MAX_QUERY_CHARS = 128
 MAX_COUNT = 50
+
+# The bearer token may only ever be delivered to DeepSeek's own endpoint. A
+# --base-url accepted from a prompt is a key-exfiltration path: an injected
+# instruction only has to append --base-url and the key travels with it.
+ALLOWED_HOSTS = frozenset({"api.deepseek.com"})
 
 # Where a key may live, in priority order after --api-key and $DEEPSEEK_API_KEY.
 KEY_FILES: List[str] = [
@@ -52,6 +61,8 @@ ALMA_FALLBACK_PORT = 23001
 # Remembering which key worked is a convenience, so it lives in its own dir
 # instead of writing into Alma's config tree.
 STATE_FILE = os.path.expanduser("~/.config/dssearch/state.json")
+CACHE_DIR = os.path.expanduser("~/.config/dssearch/cache")
+DEFAULT_CACHE_TTL = 300.0
 
 # Exit codes: stable enough for a caller (me) to branch on.
 EXIT_OK = 0
@@ -70,6 +81,93 @@ class DsError(Exception):
         super().__init__(message)
         self.exit_code = exit_code
         self.status = status
+
+
+# --------------------------------------------------------------------------
+# Input guards
+# --------------------------------------------------------------------------
+
+
+def validate_base_url(base_url: str, allow_custom: bool = False) -> str:
+    """Pin the endpoint to DeepSeek unless the caller explicitly opts out."""
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise DsError("--base-url must be an absolute http(s) URL", EXIT_USAGE)
+    host = (parsed.hostname or "").lower()
+    if host in ALLOWED_HOSTS or allow_custom:
+        return base_url.rstrip("/")
+    raise DsError(
+        "--base-url %s is not an allowed host (%s): the API key would be sent to "
+        "it. Pass --allow-custom-host if that is really what you want."
+        % (base_url, ", ".join(sorted(ALLOWED_HOSTS))),
+        EXIT_USAGE,
+    )
+
+
+# CommonMark: a backslash before one of these ASCII punctuation chars is an escape.
+_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+
+
+def unescape_markdown(text: str) -> str:
+    """Undo CommonMark backslash escapes.
+
+    DeepSeek's Fetch returns text where every punctuation mark that could carry
+    meaning in Markdown is escaped (``2026\\-10\\-18``, ``Source\\: Xinhua``).
+    That is legal Markdown, but viewers show the backslashes and it costs tokens
+    for nothing. Only the chars CommonMark defines as escapable are touched, so
+    a genuine backslash survives.
+    """
+    return _ESCAPABLE.sub(r"\1", text)
+
+
+# --------------------------------------------------------------------------
+# Response cache (search only: a repeated query is the common waste)
+# --------------------------------------------------------------------------
+
+
+def _cache_path(parts: List[Any]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(parts, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:32]
+    return os.path.join(os.environ.get("DSSEARCH_CACHE_DIR") or CACHE_DIR, digest + ".json")
+
+
+def cache_get(parts: List[Any], ttl: float) -> Optional[Dict[str, Any]]:
+    if ttl <= 0:
+        return None
+    try:
+        with open(_cache_path(parts), "r", encoding="utf-8") as fh:
+            entry = json.load(fh)
+        if not isinstance(entry, dict):
+            return None
+        if time.time() - float(entry.get("at") or 0) > ttl:
+            return None
+        data = entry.get("data")
+        return data if isinstance(data, dict) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def cache_put(parts: List[Any], data: Dict[str, Any], ttl: float) -> None:
+    if ttl <= 0:
+        return
+    path = _cache_path(parts)
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "data": data}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def cache_disabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_cache", False):
+        return True
+    return str(os.environ.get("DSSEARCH_CACHE", "")).lower() in ("0", "off", "false", "no")
 
 
 # --------------------------------------------------------------------------
@@ -142,6 +240,7 @@ def call_api(
     timeout: float = DEFAULT_TIMEOUT,
     proxy: Optional[str] = None,
     retries: int = DEFAULT_RETRIES,
+    deadline: float = DEFAULT_DEADLINE,
     sleep=None,
 ) -> Dict[str, Any]:
     """POST to /v1/tools/<endpoint> with retries on 408/429/5xx and transport errors."""
@@ -156,8 +255,17 @@ def call_api(
     attempts = max(1, retries)
     sleep = sleep or time.sleep
     last: Optional[DsError] = None
+    start = time.monotonic()
 
     for attempt in range(attempts):
+        if attempt:
+            elapsed = time.monotonic() - start
+            if elapsed + timeout > deadline:
+                raise DsError(
+                    "%s: out of time after %.0fs (--deadline %.0fs)"
+                    % (what, elapsed, deadline),
+                    (last.exit_code if last else EXIT_NETWORK),
+                )
         delay = min(8.0, 0.6 * (2 ** attempt)) * (0.8 + random.random() * 0.4)
         try:
             status, resp_headers, body = post_json(url, payload, headers, timeout, proxy)
@@ -282,8 +390,18 @@ def _remember_working(label: str) -> None:
         pass
 
 
-def _fingerprint(key: str) -> str:
-    return "%d:%s" % (len(key), key[-4:])
+def _warn_if_loose(path: str) -> None:
+    """A key file readable by anyone else is worth one line on stderr."""
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        return
+    if mode & 0o077:
+        print(
+            "warning: %s is group/world accessible (mode %o); run: chmod 600 %s"
+            % (path, mode, path),
+            file=sys.stderr,
+        )
 
 
 def resolve_api_keys(
@@ -307,9 +425,12 @@ def resolve_api_keys(
     for path in KEY_FILES:
         try:
             with open(path, "r", encoding="utf-8") as fh:
-                add(fh.read(), path)
+                stored = fh.read()
         except OSError:
             continue
+        if stored.strip():
+            _warn_if_loose(path)
+        add(stored, path)
     if use_alma:
         alma = alma_key_candidates()
         last_good = _read_state().get("last_good")
@@ -372,7 +493,12 @@ def _clip(text: str, limit: int) -> str:
     return text
 
 
-def format_search(result: Dict[str, Any], max_summary: int = 800, max_content: int = 0) -> str:
+def format_search(
+    result: Dict[str, Any],
+    max_summary: int = 800,
+    max_content: int = 0,
+    unescape: bool = True,
+) -> str:
     items: List[Dict[str, Any]] = result.get("results") or []
     if not items:
         return "No results."
@@ -398,6 +524,8 @@ def format_search(result: Dict[str, Any], max_summary: int = 800, max_content: i
             lines.append("   " + _clip(summary, max_summary).replace("\n", " "))
         content = item.get("content") or ""
         if max_content and content:
+            if unescape:
+                content = unescape_markdown(content)
             lines.append("   --- content ---")
             lines.append(_clip(content, max_content))
         blocks.append("\n".join(lines))
@@ -407,6 +535,20 @@ def format_search(result: Dict[str, Any], max_summary: int = 800, max_content: i
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
+
+
+def empty_exit(args: argparse.Namespace) -> int:
+    """Exit code for "worked, but found nothing" (6, unless the caller overrides)."""
+    override = getattr(args, "empty_exit", None)
+    if override is None:
+        raw = os.environ.get("DSSEARCH_EMPTY_EXIT")
+        if raw is None or raw.strip() == "":
+            return EXIT_EMPTY
+        try:
+            override = int(raw)
+        except ValueError:
+            return EXIT_EMPTY
+    return override if 0 <= override <= 125 else EXIT_EMPTY
 
 
 def cmd_search(args: argparse.Namespace, candidates: List[Tuple[str, str]]) -> int:
@@ -426,18 +568,33 @@ def cmd_search(args: argparse.Namespace, candidates: List[Tuple[str, str]]) -> i
     if args.localization:
         payload["localization"] = args.localization
 
-    data, _label = call_with_fallback(
-        candidates,
-        lambda key: call_api(
-            "search",
-            payload,
-            key,
-            base_url=args.base_url,
-            timeout=args.timeout,
-            proxy=args.proxy,
-            retries=args.retries,
-        ),
-    )
+    ttl = 0.0 if cache_disabled(args) else args.cache_ttl
+    cache_parts = [
+        "search",
+        args.base_url,
+        query,
+        args.count,
+        bool(args.need_content),
+        args.ori_question or "",
+        args.localization or "",
+    ]
+    data = cache_get(cache_parts, ttl)
+    if data is None:
+        data, _label = call_with_fallback(
+            candidates,
+            lambda key: call_api(
+                "search",
+                payload,
+                key,
+                base_url=args.base_url,
+                timeout=args.timeout,
+                proxy=args.proxy,
+                retries=args.retries,
+                deadline=args.deadline,
+            ),
+        )
+        if data.get("results"):
+            cache_put(cache_parts, data, ttl)
     items = data.get("results") or []
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
@@ -447,10 +604,11 @@ def cmd_search(args: argparse.Namespace, candidates: List[Tuple[str, str]]) -> i
                 data,
                 args.max_summary_chars,
                 args.max_content_chars if args.need_content else 0,
+                unescape=not args.no_unescape,
             )
         )
     if not items:
-        return EXIT_EMPTY
+        return empty_exit(args)
     return EXIT_OK
 
 
@@ -472,6 +630,7 @@ def cmd_fetch(args: argparse.Namespace, candidates: List[Tuple[str, str]]) -> in
             timeout=args.timeout,
             proxy=args.proxy,
             retries=args.retries,
+            deadline=args.deadline,
         ),
     )
     if args.json:
@@ -479,6 +638,9 @@ def cmd_fetch(args: argparse.Namespace, candidates: List[Tuple[str, str]]) -> in
         return EXIT_OK
     title = data.get("title") or ""
     content = data.get("content") or ""
+    if not args.no_unescape:
+        title = unescape_markdown(title)
+        content = unescape_markdown(content)
     if args.max_content_chars:
         content = _clip(content, args.max_content_chars)
     if title:
@@ -511,6 +673,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             proxy=args.proxy,
             retries=1,
+            deadline=args.deadline,
         )
 
     data, label = call_with_fallback(candidates, probe)
@@ -531,9 +694,19 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--api-key", help="DeepSeek API key (default: resolve automatically)")
     common.add_argument("--base-url", default=DEFAULT_BASE_URL, help="default %(default)s")
+    common.add_argument(
+        "--allow-custom-host",
+        action="store_true",
+        help="permit a --base-url that is not api.deepseek.com (the key goes there!)",
+    )
     common.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="seconds, default %(default)s")
     common.add_argument("--proxy", default=os.environ.get("DSSEARCH_PROXY"), help="e.g. http://127.0.0.1:7897")
     common.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="attempts, default %(default)s")
+    common.add_argument(
+        "--deadline", type=float, default=DEFAULT_DEADLINE,
+        help="total wall clock budget in seconds, default %(default)s",
+    )
+    common.add_argument("--no-unescape", action="store_true", help="keep CommonMark backslash escapes")
     common.add_argument("--json", action="store_true", help="print the raw API JSON")
 
     parser = argparse.ArgumentParser(
@@ -552,6 +725,15 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--localization", help="an IP to localize results")
     search.add_argument("--max-summary-chars", type=int, default=800, help="default %(default)s, 0 = no limit")
     search.add_argument("--max-content-chars", type=int, default=2000, help="only with -c, default %(default)s")
+    search.add_argument(
+        "--empty-exit", type=int, default=None,
+        help="exit code when nothing is found, default %d (env: DSSEARCH_EMPTY_EXIT)" % EXIT_EMPTY,
+    )
+    search.add_argument("--no-cache", action="store_true", help="skip the %ds response cache" % DEFAULT_CACHE_TTL)
+    search.add_argument(
+        "--cache-ttl", type=float, default=DEFAULT_CACHE_TTL,
+        help="seconds to reuse a previous identical search, 0 disables, default %(default)s",
+    )
     search.set_defaults(func=cmd_search)
 
     fetch = sub.add_parser("fetch", parents=[common], help="read one page as markdown")
@@ -574,6 +756,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_USAGE
 
     try:
+        # Before a key is even read: refuse to aim it at somebody else's host.
+        args.base_url = validate_base_url(args.base_url, getattr(args, "allow_custom_host", False))
         if args.command == "doctor":
             return cmd_doctor(args)
         candidates = resolve_api_keys(args.api_key)
